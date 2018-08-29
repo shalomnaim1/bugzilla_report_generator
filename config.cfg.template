@@ -1,0 +1,13 @@
+---
+# Creds to your bugzilla account
+username: 
+password: 
+
+# qe_contact is a list of contanct you want to generate the report for
+qa_contacts: ['con_name1', 'con_name2']
+
+# flags is a lis to flages you want to get infro for the BZs
+flags: ["qe_test_coverage+", "qe_test_coverage-", "qe_test_coverage?"]
+
+# certificate file name (Yoha have to get this file from gcloud)
+certificate_name: "qa-test-report.json"
