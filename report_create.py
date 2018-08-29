@@ -4,12 +4,17 @@ import getpass
 import bugzilla
 import itertools
 import threading
+import time
+from progressbar.progressbar import ProgressBar
 import yaml
 from collections import OrderedDict
 from operator import attrgetter
 from gspread import authorize, utils
 from oauth2client.service_account import ServiceAccountCredentials
 from Queue import Queue
+from Queue import Empty
+
+
 
 class Bug(object):
     MAPPING = OrderedDict()
@@ -65,25 +70,6 @@ class Bug(object):
     def get_bug_row(self, cols_order):
         pass
 
-class Report(object):
-    def __init__(self, **kwargs):
-        self.bugs = kwargs.get("bugs", [])
-        self.columes = []
-
-    def get_report_title(self):
-        return []
-
-    def get_report(self):
-
-        return itertools.chain(*[[self.get_report_title()],
-                                 [b.get_bug_row() for b in self.bugs]])
-
-    def add_report_column(self):
-        pass
-
-    def add_bug(self, bug):
-        self.bugs.append(Bug.create_from_bug(bug))
-
 class task(object):
     def __init__(self, args, kwargs):
         self.args = args
@@ -91,17 +77,51 @@ class task(object):
         self.trycount = 0
 
 class parallelizer(object):
+    """
+    Run parallel tasks based on the producer consumer idea.
+    """
 
     def __init__(self, workers_limit=3, max_reties=3):
+        """
+        Init method for the parallelizer class
+        :param workers_limit: number of workers
+        :param max_reties: number of retries for failed tasks
+        """
+
         self.max_reties = max_reties
         self.limit = workers_limit
         self.wait_for_tasks = True
         self.tasks = Queue()
         self.workers = []
+        self.added_task_count = 0
+        self.done_tasks = 0
+
+    @property
+    def count_of_tasks_on_the_pipeline(self):
+        return self.tasks.unfinished_tasks
+
+    @property
+    def has_tasks_on_pipeline(self):
+        return not self.tasks.empty()
+
+    @property
+    def get_done_percentage(self):
+        return float(self.done_tasks) / self.added_task_count * 100
 
     def worker(self):
-        while self.wait_for_tasks or not self.tasks.empty():
-            task = self.tasks.get()
+        """
+        This function implements a sungle worker that runs tasks
+        The worker manages runs his tasks using threads
+        Each worker manages one thread at the time
+        :return: None
+        """
+
+        while self.wait_for_tasks:
+            try:
+                task = self.tasks.get(timeout=1)
+            except Empty as e:
+                continue
+
             t = threading.Thread(*task.args, **task.kwargs)
             try:
                 t.start()
@@ -115,33 +135,71 @@ class parallelizer(object):
                     self.add_for_retry(task)
             finally:
                 self.tasks.task_done()
+                self.done_tasks += 1
 
     def _add_worker(self):
+        """
+        Private function for add worker to the parallelizer
+        :return: None
+        """
+
         w = threading.Thread(target=self.worker)
         w.daemon = True
         self.workers.append(w)
         w.start()
 
     def start_parallelizer(self):
+        """
+        Create workers as required on init and run them.
+        :return:
+        """
+
         for _ in xrange(self.limit):
             self._add_worker()
 
-    def stop_parallelizer(self, join=True):
+    def stop_parallelizer(self, wait_for_workers_cleanup=True, wait_for_tasks_in_queue=True):
+        """
+        Stop the parallelizer
+        :param join: wait for unfinished tasks
+        :return: None
+        """
+
+        # wait until the queue become empty if required
+        while self.has_tasks_on_pipeline and wait_for_tasks_in_queue:
+            print "has tasks: {}".format(self.has_tasks_on_pipeline)
+            print "wait? : {}".format(wait_for_tasks_in_queue)
+            time.sleep(0.1)
+
+
         self.wait_for_tasks = False
-        if join:
+
+        if wait_for_workers_cleanup:
             map(lambda t: t.join(), self.workers)
 
     def add_task(self, *args, **kwargs):
+        """
+        "Add a new task to do"
+        :param args: args to pass the execution thread
+        :param kwargs: kwargs to pass the execution thread
+        :return: None
+        """
+
         self.tasks.put(task(args, kwargs))
+        self.added_task_count += 1
 
     def add_for_retry(self, task):
+        """
+        Add a task in retry mode
+        :param task: task to add
+        :return:
+        """
+
         task.trycount += 1
         self.tasks.put(task)
 
 class report_gen(object):
 
     def __init__(self, url, username, password):
-        print "Init BZ object"
         self.bz = bugzilla.Bugzilla(url=url)
         self.bz.bug_autorefresh = True
         self.bz.login(user=username, password=password)
@@ -149,7 +207,6 @@ class report_gen(object):
         self.all_bugs = []
 
     def get_issues_for_qa_contact(self, contact, flag):
-        print "Requesting details for {} with the following details: flag {}".format(contact, flag)
         query = {'bug_status': ['NEW', 'ASSIGNED', 'POST', 'MODIFIED', 'ON_DEV', 'ON_QA', 'VERIFIED', 'RELEASE_PENDING', 'CLOSED'],
          'email1': '{contact}'.format(contact="|".join(contact if isinstance(contact, list) else [contact])),
          'emailqa_contact1': '1',
@@ -174,7 +231,6 @@ class report_gen(object):
             if flag != "qe_test_coverage+":
                 return ""
 
-            print "getting automate_bug state"
             flag = filter(lambda f: f["name"] == "automate_bug", bug.flags)
             state = None
             if not flag:
@@ -224,7 +280,7 @@ class report_gen(object):
                                   [s.lstrip() for s in self.get_report_title().replace('\n', "").split(",")].index(filed) + 1)[:1]
 
     def save_to_file(self, path):
-        print "Saving results"
+
         with open(path, "w") as f:
             f.write(self.get_report_title())
             for bug in self.all_bugs:
@@ -296,7 +352,6 @@ class report_gen(object):
             }
             return {"body": payload}
 
-        print "Saving to spreadsheet"
         scope = ['https://spreadsheets.google.com/feeds', "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_name(certificat_name, scope)
 
@@ -317,12 +372,11 @@ class report_gen(object):
 
         client.session.close()
 
-
 def main():
 
+    print "Loading configuration"
     with open("config.cfg", "r") as f:
         config = yaml.load(f)
-
 
     qa_contacts = config["qa_contacts"]
     flags = config["flags"]
@@ -332,24 +386,54 @@ def main():
 
     username = os.getenv("BZ_USER", username)
     if not username:
-        print "Username was neither available at the config file or env vars (var name: BZ_USER)\nplease input user name manually"
+        print ("Username was neither available at the config file or env vars (var name: BZ_USER)\n"
+              "please input user name manually")
         username = raw_input("Username: ")
 
     password = os.getenv("BZ_PASSWORD", password)
     if not password:
-        print "Password was neither available at the config file or env vars (BZ_USER)\nplease input password manually"
+        print ("Password was neither available at the config file or env vars (BZ_USER)\n"
+               "please input password manually")
         password = getpass.getpass()
 
-    g = report_gen("https://bugzilla.redhat.com", username=username, password=password)
-    g.parallelizer.start_parallelizer()
+    print "Collecting issues from Bugzilla"
+    report_builder = report_gen("https://bugzilla.redhat.com", username=username, password=password)
+    report_builder.parallelizer.start_parallelizer()
 
     for flag in flags:
-        g.get_issues_for_qa_contact(qa_contacts, flag)
+        report_builder.get_issues_for_qa_contact(qa_contacts, flag)
 
-    g.parallelizer.stop_parallelizer()
+    print ""
+    print "*********************"
+    print ""
+    print "*** Total ***********"
+    print "{count} issues found".format(count=len(report_builder.all_bugs))
+    print "***By User **********"
 
-    g.save_to_google_drive_full_report(qa_contacts, flags, certificate_name)
-    print "issue found: {i}".format(i=len(g.all_bugs))
+    issues_by_user = {}
+
+    for issue in report_builder.all_bugs:
+        contact = issue[1]
+        issues_by_user[contact] = issues_by_user.get(contact,0) + 1
+
+    for contact, count in issues_by_user.items():
+        print "{contact}: {count}".format(contact=contact, count=count)
+    print "*********************"
+    print ""
+
+    pbar = ProgressBar().start()
+    pbar.start()
+
+    while report_builder.parallelizer.has_tasks_on_pipeline:
+        pbar.update(report_builder.parallelizer.get_done_percentage)
+        time.sleep(0.2)
+    pbar.finish()
+
+    print "Waiting for all the workers to finish"
+    report_builder.parallelizer.stop_parallelizer()
+
+    print "Saving report to G cloud"
+    report_builder.save_to_google_drive_full_report(qa_contacts, flags, certificate_name)
 
 if __name__ == "__main__":
     main()
